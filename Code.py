@@ -1,3 +1,4 @@
+import os
 import re
 import datetime
 import requests
@@ -156,4 +157,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"🚀 Веб-сервер запущен на порту {port}")
     app.run(host='0.0.0.0', port=port)
+
 
