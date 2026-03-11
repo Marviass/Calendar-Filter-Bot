@@ -9,7 +9,8 @@ from flask import Flask, Response, request
 from threading import Thread
 
 # === НАСТРОЙКИ ===
-BOT_TOKEN = "8725292945:AAHeVqgqtHz5N4zAHj9YZHO_tJNgKEzmu5g"
+BOT_TOKEN = os.environ.get("BOT_TOKEN") 
+bot = telebot.TeleBot(BOT_TOKEN)
 # Если запускаешь локально, оставь так. На хостинге замени на реальный домен.
 BASE_URL = "https://tsucalbot.onrender.com" 
 
@@ -155,3 +156,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"🚀 Веб-сервер запущен на порту {port}")
     app.run(host='0.0.0.0', port=port)
+
