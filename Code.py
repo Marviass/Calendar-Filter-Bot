@@ -9,7 +9,7 @@ from flask import Flask, Response, request
 from threading import Thread
 
 # === НАСТРОЙКИ ===
-BOT_TOKEN = "8725292945:AAGB9vH7bhf448PUedHSEQYD9Bk2vi-30jY"
+BOT_TOKEN = "8725292945:AAHeVqgqtHz5N4zAHj9YZHO_tJNgKEzmu5g"
 # Если запускаешь локально, оставь так. На хостинге замени на реальный домен.
 BASE_URL = "https://tsucalbot.onrender.com" 
 
