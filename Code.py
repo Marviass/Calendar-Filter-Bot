@@ -138,19 +138,28 @@ def handle_save(c):
 from threading import Thread
 
 def run_bot():
-    print("🤖 Запуск polling...")
-    try:
-        # Пробуем запуститься без удаления вебхука (иногда это мешает)
-        bot.polling(none_stop=True)
-    except Exception as e:
-        print(f"❌ Критическая ошибка: {e}")
+    print("🤖 Запуск бота в фоне...")
+    while True:
+        try:
+            bot.remove_webhook()
+            bot.polling(none_stop=True, interval=0, timeout=20)
+        except Exception as e:
+            print(f"❌ Ошибка: {e}")
+            import time
+            time.sleep(5)
 
-# Запускаем поток сразу при импорте файла сервером
-bot_thread = Thread(target=run_bot, daemon=True)
-bot_thread.start()
-
-# Оставляем это для локальных тестов, но Render будет использовать объект 'app' напрямую
+# Этот блок выполнится только один раз!
 if __name__ == "__main__":
+    from threading import Thread
+    
+    # 1. Запускаем бота
+    bot_thread = Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+
+    # 2. Запускаем веб-сервер (без Gunicorn)
     port = int(os.environ.get("PORT", 10000))
+    print(f"🚀 Веб-сервер запущен на порту {port}")
+    app.run(host='0.0.0.0', port=port)et("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
