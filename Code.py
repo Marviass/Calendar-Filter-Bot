@@ -136,26 +136,27 @@ def handle_save(c):
 # === ЗАПУСК ===
 
 def run_bot():
-    bot.infinity_polling()
+    print("🤖 Бот запускается...")
+    while True:
+        try:
+            bot.remove_webhook() # Очистка старых соединений
+            bot.polling(none_stop=True, interval=0, timeout=20)
+        except Exception as e:
+            print(f"❌ Ошибка бота: {e}")
+            import time
+            time.sleep(5)
 
 if __name__ == "__main__":
-    # 1. Запускаем бота в отдельном потоке
+    # Запускаем бота в отдельном "потоке", чтобы он не мешал веб-серверу
     from threading import Thread
-    def run_bot():
-        print("🤖 Бот запускается...")
-        while True:
-            try:
-                bot.infinity_polling()
-            except Exception as e:
-                print(f"Ошибка бота: {e}")
-                import time
-                time.sleep(5)
+    thread = Thread(target=run_bot)
+    thread.daemon = True # Поток умрет вместе с основным процессом
+    thread.start()
 
-    Thread(target=run_bot, daemon=True).start()
-
-    # 2. Запускаем Flask на порту, который даст Render
-    port = int(os.environ.get("PORT", 5000))
+    # Запускаем Flask на порту Render
+    port = int(os.environ.get("PORT", 10000))
     print(f"🚀 Веб-сервер запущен на порту {port}")
     app.run(host='0.0.0.0', port=port)
+
 
 
