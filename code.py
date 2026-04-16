@@ -21,10 +21,10 @@ logger = logging.getLogger(__name__)
 
 # === 1. КОНФИГУРАЦИЯ ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS")
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "1362280774") 
 ADMIN_IDS = [x.strip() for x in ADMIN_IDS_RAW.split(",") if x.strip()]
 
-# Настройка универсального ИИ-клиента (для RouterAI / ProxyAPI и т.д.)
+# Настройка универсального ИИ-клиента
 AI_API_KEY = os.getenv("AI_API_KEY")
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://routerai.ru/api/v1")
 AI_MODEL = os.getenv("AI_MODEL", "google/gemini-3.1-flash-lite-preview")
@@ -100,7 +100,8 @@ def init_db():
                         target_date TEXT, action TEXT, old_subject TEXT, 
                         new_subject TEXT, new_time TEXT, new_loc TEXT)''')
         
-        for col in ["new_type", "new_teacher"]:
+        # Добавил old_time для точечного удаления пар
+        for col in ["new_type", "new_teacher", "old_time"]:
             try: conn.execute(f"ALTER TABLE overrides ADD COLUMN {col} TEXT")
             except: pass
 
@@ -237,7 +238,6 @@ class ScheduleCore:
         user_subgroups = [s.lower() for s in settings.get('subgroups', [])]
         
         for ev in events:
-            # Скрываем исключенные предметы, НО пропускаем те, что добавлены через ИИ
             if ev['clean_title'].lower() in settings['excluded'] and not ev.get('is_override', False): 
                 continue
                 
@@ -273,30 +273,46 @@ class ScheduleCore:
             count += 1
         return cal.to_ical(), count
 
-# === 3.5 ИНЖЕКТОР ИИ-ИЗМЕНЕНИЙ ===
-def apply_ai_overrides(events, user_id):
+# === 3.5 ИНЖЕКТОР ИИ-ИЗМЕНЕНИЙ (ИСПРАВЛЕННЫЙ) ===
+def apply_ai_overrides(events, user_id, df_str, dt_str):
     with sqlite3.connect(DB_FILE) as conn:
-        try:
-            overrides = conn.execute("SELECT target_date, action, old_subject, new_subject, new_time, new_loc, new_type, new_teacher FROM overrides WHERE user_id=?", (user_id,)).fetchall()
-        except:
-            old_overrides = conn.execute("SELECT target_date, action, old_subject, new_subject, new_time, new_loc FROM overrides WHERE user_id=?", (user_id,)).fetchall()
-            overrides = [(*row, "", "") for row in old_overrides]
+        # Безопасное извлечение с поддержкой старых версий БД
+        rows = conn.execute("SELECT * FROM overrides WHERE user_id=?", (user_id,)).fetchall()
+        cursor = conn.execute("SELECT * FROM overrides LIMIT 0")
+        cols = [desc[0] for desc in cursor.description]
+        
+    overrides = []
+    for row in rows:
+        d = dict(zip(cols, row))
+        overrides.append((
+            d.get('target_date'), d.get('action'), d.get('old_subject'),
+            d.get('new_subject'), d.get('new_time'), d.get('new_loc'),
+            d.get('new_type', ''), d.get('new_teacher', ''), d.get('old_time', '')
+        ))
     
     if not overrides: return events
     final_events = []
     
     for ev in events:
         ev_date = ev['dtstart'].strftime("%Y-%m-%d")
+        ev_time = ev['dtstart'].strftime("%H:%M")
         skip = False
         for ov in overrides:
-            t_date, action, old_sub, new_sub, n_time, n_loc, n_type, n_teacher = ov
+            t_date, action, old_sub, new_sub, n_time, n_loc, n_type, n_teacher, old_time = ov
             if t_date == ev_date and old_sub and old_sub.lower() in ev['clean_title'].lower():
+                # ИСПРАВЛЕНИЕ: Удаляем только если совпадает время старой пары
+                if old_time and old_time != ev_time:
+                    continue 
                 if action in ["cancel", "replace"]: skip = True
         if not skip: final_events.append(ev)
             
     for ov in overrides:
-        t_date, action, old_sub, new_sub, n_time, n_loc, n_type, n_teacher = ov
+        t_date, action, old_sub, new_sub, n_time, n_loc, n_type, n_teacher, old_time = ov
         if action in ["replace", "add"] and new_sub:
+            # ИСПРАВЛЕНИЕ: Блокируем "призраков", добавляя пару только в нужный диапазон дат
+            if not (df_str <= t_date <= dt_str):
+                continue
+                
             try:
                 base_dt = datetime.datetime.strptime(t_date, "%Y-%m-%d")
                 if n_time and ":" in n_time:
@@ -352,7 +368,7 @@ def update_disciplines_for_subgroup(cid, raw, e_type):
         else: filtered.add(ev['clean_title'])
     user_data[cid]['all_disc'] = sorted(list(filtered))
 
-# === 4. UI И КЛАВИАТУРЫ ===
+# === 4. UI И КЛАВИАТУРЫ (ПОЭТАПНЫЙ ОНБОРДИНГ) ===
 def markup_roles():
     m = InlineKeyboardMarkup()
     m.row(InlineKeyboardButton("👨‍🎓 Я студент", callback_data="role_student"), InlineKeyboardButton("👨‍🏫 Я преподаватель", callback_data="role_teacher"))
@@ -372,7 +388,7 @@ def markup_profile(cid, e_type):
     if e_type == "group":
         s = user_data.get(cid)
         subs_text = ", ".join([sub.upper() for sub in s.get('subgroups', [])]) if s.get('subgroups') else "Не выбрано"
-        m.add(InlineKeyboardButton(f"💠 Подгруппы ({subs_text})", callback_data="menu_subgroups"))
+        m.add(InlineKeyboardButton(f"💠 Изменить подгруппу", callback_data="menu_subgroups"))
     m.add(InlineKeyboardButton("🔄 Перенастроить профиль", callback_data="reset_profile"))
     m.add(InlineKeyboardButton("⬅️ В меню", callback_data="back_to_main"))
     return m
@@ -384,50 +400,87 @@ def markup_subgroups(cid, is_onboarding=False):
     chosen_subs = s.get('subgroups', [])
     buttons = [InlineKeyboardButton(f"{'✅' if sub in chosen_subs else '❌'} Подгруппа {sub.upper()}", callback_data=f"tsub_{sub}_{int(is_onboarding)}") for sub in avail_subs]
     m.add(*buttons)
-    if is_onboarding: m.add(InlineKeyboardButton("Подтвердить выбор ➡️", callback_data="onb_sub_done"))
+    if is_onboarding: m.add(InlineKeyboardButton("Продолжить ➡️", callback_data="onb_step_disc"))
     else: m.add(InlineKeyboardButton("⬅️ Назад", callback_data="menu_profile"))
-    return m
-
-def markup_dates(entity_id):
-    m = InlineKeyboardMarkup()
-    m.row(InlineKeyboardButton("📅 Текущая", callback_data=f"date_curr_{entity_id}"), InlineKeyboardButton("⏭️ Следующая", callback_data=f"date_next_{entity_id}"))
-    m.add(InlineKeyboardButton("✍️ Ввести даты вручную", callback_data=f"date_manual_{entity_id}"))
-    m.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main"))
-    return m
-
-def markup_prefs(cid, is_onboarding=False):
-    s = user_data[cid]
-    m = InlineKeyboardMarkup(row_width=1)
-    rem_val = s.get('reminder', 15)
-    m.add(InlineKeyboardButton(f"⏱ Будильник: {rem_val} мин" if rem_val > 0 else "⏱ Будильник: Выкл", callback_data="toggle_remind_onb" if is_onboarding else "toggle_remind"))
-    if rem_val > 0:
-        r_type = "От Календаря 📅" if s.get('remind_type', 0) == 0 else "От Бота 🤖"
-        m.add(InlineKeyboardButton(f"🔔 Источник: {r_type}", callback_data="toggle_rtype_onb" if is_onboarding else "toggle_rtype"))
-    m.add(InlineKeyboardButton(f"🎨 Значки: {'Смысловые 🔬' if s.get('emoji_style') == 1 else 'Кружочки 🔴'}", callback_data="toggle_emoji_onb" if is_onboarding else "toggle_emoji"))
-    day_map = {-1: "Выкл ❌", 5: "Суббота", 6: "Воскресенье"}
-    time_map = {8: "Утро (08:00)", 13: "Обед (13:00)", 19: "Вечер (19:00)"}
-    d_val = s.get('auto_day', -1)
-    m.add(InlineKeyboardButton(f"📬 Рассылка: {day_map.get(d_val)}", callback_data="toggle_aday_onb" if is_onboarding else "toggle_aday"))
-    if d_val != -1: m.add(InlineKeyboardButton(f"🕒 Время: {time_map.get(s.get('auto_time', 8))}", callback_data="toggle_atime_onb" if is_onboarding else "toggle_atime"))
-    if is_onboarding: m.add(InlineKeyboardButton("Завершить ➡️", callback_data="onboard_finish"))
-    else: m.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main"))
     return m
 
 def markup_disc(cid, is_onboarding=False):
     s = user_data[cid]
     m = InlineKeyboardMarkup(row_width=1)
-    if is_onboarding: m.add(InlineKeyboardButton("Продолжить ➡️", callback_data="onboard_to_prefs"))
+    if is_onboarding: m.add(InlineKeyboardButton("Продолжить ➡️", callback_data="onb_step_emoji"))
     else: m.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main"))
     for i, d in enumerate(s.get('all_disc', [])):
         st = "❌" if d.lower() in s['excluded'] else "✅"
         m.add(InlineKeyboardButton(f"{st} {d[:35]}", callback_data=f"do_{i}" if is_onboarding else f"d_{i}"))
     return m
 
+def markup_onb_emoji(cid):
+    s = user_data[cid]
+    m = InlineKeyboardMarkup(row_width=1)
+    m.add(InlineKeyboardButton(f"🎨 Выбрано: {'Emoji 🔬' if s.get('emoji_style') == 1 else 'Кружки (как в TSUInTime) 🔴'}", callback_data="toggle_emoji_onb"))
+    m.add(InlineKeyboardButton("Продолжить ➡️", callback_data="onb_step_remind"))
+    return m
+
+def markup_onb_remind(cid):
+    s = user_data[cid]
+    m = InlineKeyboardMarkup(row_width=1)
+    rem_val = s.get('reminder', 15)
+    m.add(InlineKeyboardButton(f"⏱ Уведомление: за {rem_val} мин" if rem_val > 0 else "Выкл.", callback_data="toggle_remind_onb"))
+    m.add(InlineKeyboardButton("Продолжить ➡️", callback_data="onb_step_rtype"))
+    return m
+
+def markup_onb_rtype(cid):
+    s = user_data[cid]
+    m = InlineKeyboardMarkup(row_width=1)
+    r_type = "От приложения 📅" if s.get('remind_type', 0) == 0 else "От бота 🤖"
+    m.add(InlineKeyboardButton(f"🔔 Источник: {r_type}", callback_data="toggle_rtype_onb"))
+    m.add(InlineKeyboardButton("Продолжить ➡️", callback_data="onb_step_auto"))
+    return m
+
+def markup_onb_auto(cid):
+    s = user_data[cid]
+    m = InlineKeyboardMarkup(row_width=1)
+    day_map = {-1: "Выкл. ❌", 5: "Суббота", 6: "Воскресенье"}
+    time_map = {8: "08:00", 13: "13:00", 19: "19:00"}
+    d_val = s.get('auto_day', -1)
+    m.add(InlineKeyboardButton(f"📬 День рассылки: {day_map.get(d_val)}", callback_data="toggle_aday_onb"))
+    if d_val != -1: m.add(InlineKeyboardButton(f"🕒 Время: {time_map.get(s.get('auto_time', 8))}", callback_data="toggle_atime_onb"))
+    m.add(InlineKeyboardButton("Продолжить ➡️", callback_data="onb_step_ai"))
+    return m
+
+def markup_onb_ai():
+    m = InlineKeyboardMarkup()
+    m.add(InlineKeyboardButton("Понятно! Завершить настройку ✅", callback_data="onboard_finish"))
+    return m
+
+def markup_prefs(cid):
+    s = user_data[cid]
+    m = InlineKeyboardMarkup(row_width=1)
+    rem_val = s.get('reminder', 15)
+    m.add(InlineKeyboardButton(f"⏱ Уведомления: за {rem_val} мин" if rem_val > 0 else "Выкл.", callback_data="toggle_remind"))
+    if rem_val > 0:
+        r_type = "От приложения 📅" if s.get('remind_type', 0) == 0 else "От бота 🤖"
+        m.add(InlineKeyboardButton(f"🔔 Источник: {r_type}", callback_data="toggle_rtype"))
+    m.add(InlineKeyboardButton(f"🎨 Значки: {'Emoji 🔬' if s.get('emoji_style') == 1 else 'Кружки 🔴'}", callback_data="toggle_emoji"))
+    day_map = {-1: "Выкл ❌", 5: "Суббота", 6: "Воскресенье"}
+    time_map = {8: "08:00", 13: "13:00", 19: "19:00"}
+    d_val = s.get('auto_day', -1)
+    m.add(InlineKeyboardButton(f"📬 Авто-рассылка: {day_map.get(d_val)}", callback_data="toggle_aday"))
+    if d_val != -1: m.add(InlineKeyboardButton(f"🕒 Время: {time_map.get(s.get('auto_time', 8))}", callback_data="toggle_atime"))
+    m.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main"))
+    return m
+
+def markup_dates(entity_id):
+    m = InlineKeyboardMarkup()
+    m.add(InlineKeyboardButton("📅 Текущая неделя", callback_data=f"date_curr_{entity_id}"))
+    m.add(InlineKeyboardButton("⏭️ Следующая неделя", callback_data=f"date_next_{entity_id}"))
+    m.add(InlineKeyboardButton("✍️ Свои даты", callback_data=f"date_manual_{entity_id}"))
+    m.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main"))
+    return m
+
 def markup_download():
     m = InlineKeyboardMarkup(row_width=1)
-    # Кнопка с ссылкой на твой сервис донатов
-    m.add(InlineKeyboardButton("☕ Поддержать автора", url="https://pay.cloudtips.ru/p/8e989559")) 
-    
+    m.add(InlineKeyboardButton("☕ Поддержать автора", url="https://pay.cloudtips.ru/p/8e989559"))
     m.row(InlineKeyboardButton("🆘 Помощь", callback_data="help_save"), InlineKeyboardButton("🏠 В меню", callback_data="back_to_main"))
     return m
 
@@ -448,9 +501,9 @@ def show_main_menu(cid, message_id=None):
         subs_str = ",".join([s.upper() for s in settings.get('subgroups', [])])
         profile_text = f"👨‍🎓 Студент группы **{e_name} ({subs_str})**"
     else:
-        profile_text = f"👨‍🏫 Преподаватель **{e_name}**"
+        profile_text = f"👨‍🏫 **{e_name}**"
         
-    text = f"Главное меню 🏠\n\nВаш профиль: {profile_text}\n\nЧто будем делать?"
+    text = f"🏠 Главное меню\nПрофиль: {profile_text}"
     if message_id: 
         try: bot.edit_message_text(text, cid, message_id, parse_mode="Markdown", reply_markup=markup_main_menu(e_type))
         except: pass
@@ -476,9 +529,9 @@ def auto_mailing_loop():
                     dt = (now_tomsk.date() - datetime.timedelta(days=now_tomsk.weekday()) + datetime.timedelta(days=13)).strftime("%Y-%m-%d")
                     raw = ScheduleCore.fetch_json(s['entity_id'], df, dt, e_type)
                     if raw and raw.get('grid'):
-                        evs = apply_ai_overrides(ScheduleCore.parse_events(raw), uid)
+                        evs = apply_ai_overrides(ScheduleCore.parse_events(raw), uid, df, dt)
                         f_ical, count = ScheduleCore.generate_ics(evs, s, e_type)
-                        bot.send_document(uid, (f"TSU_Mailing_{df}.ics", f_ical), caption=f"📬 **Еженедельная рассылка!** Найдено {count} пар.")
+                        bot.send_document(uid, (f"TSU_Mailing_{df}.ics", f_ical), caption=f"📬 **Еженедельная рассылка!** Найдено {count} пар.", reply_markup=markup_download())
             except Exception as e: logger.error(f"Ошибка рассылки: {e}")
         time.sleep(40)
 
@@ -501,7 +554,7 @@ def bot_alerts_loop():
                     e_type, _ = get_entity_info(s['entity_id'])
                     raw = ScheduleCore.fetch_json(s['entity_id'], df, df, e_type)
                     if not raw: continue
-                    events = apply_ai_overrides(ScheduleCore.parse_events(raw), uid)
+                    events = apply_ai_overrides(ScheduleCore.parse_events(raw), uid, df, df)
                     user_subs = [sub.lower() for sub in s.get('subgroups', [])]
                     for ev in events:
                         if ev['clean_title'].lower() in s['excluded'] and not ev.get('is_override', False): continue
@@ -541,7 +594,7 @@ def admin_commands(m):
         bot.send_message(m.chat.id, "🛠 **Админка:**\n`/stats`, `/top`, `/broadcast [текст]`", parse_mode="Markdown")
     elif cmd == '/stats':
         with sqlite3.connect(DB_FILE) as conn: total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        bot.send_message(m.chat.id, f"📊 Юзеров: **{total}**", parse_mode="Markdown")
+        bot.send_message(m.chat.id, f"📊 Пользователей: **{total}**", parse_mode="Markdown")
     elif cmd == '/broadcast':
         text = m.text.replace("/broadcast", "").strip()
         if text:
@@ -561,7 +614,7 @@ def start(m):
         if e_name != "Неизвестно":
             show_main_menu(m.chat.id)
             return
-    bot.send_message(m.chat.id, "Привет! 🎓 Давай настроим профиль. Кто ты?", reply_markup=markup_roles())
+    bot.send_message(m.chat.id, "Привет! Для начала мне нужно задать пару вопросов:\n Кем Вы являетесь в ТГУ?", reply_markup=markup_roles())
 
 @bot.message_handler(commands=['asalways'])
 def as_always(m):
@@ -572,6 +625,34 @@ def as_always(m):
     mon = today - datetime.timedelta(days=today.weekday()) + datetime.timedelta(days=7)
     df, dt = mon.strftime("%Y-%m-%d"), (mon + datetime.timedelta(days=6)).strftime("%Y-%m-%d")
     load_schedule(m.chat.id, settings['entity_id'], df, dt)
+    
+@bot.message_handler(commands=['clearchanges'])
+def clear_ai_changes(m):
+    cid = m.chat.id
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            # Сначала считаем, сколько изменений было у пользователя (просто для красивого ответа)
+            cursor = conn.execute("SELECT COUNT(*) FROM overrides WHERE user_id=?", (cid,))
+            count = cursor.fetchone()[0]
+            
+            if count > 0:
+                # Удаляем все изменения конкретно этого юзера
+                conn.execute("DELETE FROM overrides WHERE user_id=?", (cid,))
+                bot.reply_to(
+                    m, 
+                    f"🧹 **Готово!**\nУдалено {count} Ваших изменений (переносов/отмен).\n\nТеперь Ваше расписание снова на 100% совпадает с официальными данными ТГУ.", 
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🏠 В меню", callback_data="back_to_main"))
+                )
+            else:
+                bot.reply_to(
+                    m, 
+                    "У вас пока нет сохраненных изменений от ИИ. Ваше расписание и так официальное! 🎓", 
+                    reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🏠 В меню", callback_data="back_to_main"))
+                )
+    except Exception as e:
+        logger.error(f"Ошибка при очистке изменений: {e}")
+        bot.reply_to(m, "❌ Произошла ошибка при очистке базы данных. Попробуйте позже.")
 
 @bot.message_handler(func=lambda m: user_state.get(m.chat.id) == "wait_feedback")
 def handle_feedback(m):
@@ -593,7 +674,7 @@ def search_entity_handler(m):
         for name, eid in ALL_TEACHERS.items():
             if query in name.lower(): matches.append(('teacher', name, eid))
         
-    if not matches: bot.reply_to(m, "❌ Не найдено. Попробуй еще раз:"); return
+    if not matches: bot.reply_to(m, "❌ Не найдено. Попробуйте еще раз:"); return
     if len(matches) == 1:
         e_type, e_name, e_id = matches[0]
         user_data[m.chat.id] = {'entity_id': e_id, 'subgroups': [], 'excluded': set(), 'short_fio': False, 'reminder': 15, 'emoji_style': 0, 'auto_day': -1, 'auto_time': 8, 'remind_type': 0}
@@ -609,11 +690,11 @@ def search_entity_handler(m):
             user_data[m.chat.id]['subgroups_list'] = ScheduleCore.extract_dynamic_subgroups(raw)
             if user_data[m.chat.id]['subgroups_list']: user_data[m.chat.id]['subgroups'] = [user_data[m.chat.id]['subgroups_list'][0]]
             save_user_settings(m.chat.id, user_data[m.chat.id])
-            bot.edit_message_text("🎓 **Шаг 1 из 3: Подгруппы**", m.chat.id, msg.message_id, parse_mode="Markdown", reply_markup=markup_subgroups(m.chat.id, True))
+            bot.edit_message_text("🎓 **Выберите подгруппу (-ы)**", m.chat.id, msg.message_id, parse_mode="Markdown", reply_markup=markup_subgroups(m.chat.id, True))
         else:
             if raw: user_data[m.chat.id]['all_disc'] = sorted(list(set(e['clean_title'] for e in ScheduleCore.parse_events(raw))))
             save_user_settings(m.chat.id, user_data[m.chat.id])
-            bot.edit_message_text("👨‍🏫 **Шаг 1: Настройки**", m.chat.id, msg.message_id, parse_mode="Markdown", reply_markup=markup_prefs(m.chat.id, True))
+            bot.edit_message_text("🎨 **Выберите условные обозначения занятий:**", m.chat.id, msg.message_id, parse_mode="Markdown", reply_markup=markup_onb_emoji(m.chat.id))
     elif len(matches) <= 15:
         markup = InlineKeyboardMarkup(row_width=1)
         for et, en, ei in matches: markup.add(InlineKeyboardButton(en, callback_data=f"sel_{'g' if et == 'group' else 't'}_{ei}"))
@@ -636,7 +717,7 @@ def handle_smart_message(m):
     cid = m.chat.id
     if not ai_client or cid not in user_data: return
     
-    msg = bot.reply_to(m, "🤖 Поднимаю твоё расписание и анализирую...")
+    msg = bot.reply_to(m, "🤖 Анализирую расписание...")
     
     s = user_data[cid]
     e_type, _ = get_entity_info(s['entity_id'])
@@ -650,7 +731,7 @@ def handle_smart_message(m):
     
     schedule_context = "ОФИЦИАЛЬНОЕ РАСПИСАНИЕ ПОЛЬЗОВАТЕЛЯ НА БЛИЖАЙШИЕ ДНИ:\n"
     if not events:
-        schedule_context += "Пусто (пар нет).\n"
+        schedule_context += "Пар не найдено.\n"
     else:
         user_subs = [sub.lower() for sub in s.get('subgroups', [])]
         type_map = {"LECTURE": "Лекция", "PRACTICE": "Практика", "LABORATORY": "Лабораторная", "SEMINAR": "Семинар"}
@@ -679,29 +760,32 @@ def handle_smart_message(m):
 
     system_prompt = f"""
     Ты умный ассистент студента. Сегодня {today.strftime('%d.%m.%Y')}.
-    Твоя задача — сопоставить сообщение пользователя с его РЕАЛЬНЫМ расписанием.
+    Твоя задача — сопоставить сообщение пользователя с его РЕАЛЬНЫМ расписанием и сформировать JSON-ответ.
     
     {schedule_context}
     
-    ПРАВИЛА:
-    1. Если не хватает данных (непонятно дата, предмет или тип пары) — верни "status": "clarify". В "message" задай уточняющий вопрос И ОБЯЗАТЕЛЬНО укажи детали из расписания (время, тип, аудиторию).
-    2. Если всё понятно, верни "status": "success".
-    3. В "new_type" ты ДОЛЖЕН вернуть СТРОГО одно из системных значений (например: LECTURE, PRACTICE, LABORATORY, SEMINAR, EXAM, CONTROL_WORK, CONSULTATION). Скопируй его из отменяемой пары, либо определи по контексту.
-    4. Если аудитория или преподаватель не меняются, скопируй их из расписания.
+    ПРАВИЛА АНАЛИЗА:
+    1. ИДЕНТИФИКАЦИЯ ПАРЫ: Внимательно сверяй сообщение с расписанием. Если в один день стоит НЕСКОЛЬКО пар с одинаковым названием (например, лекция и практика), а пользователь не уточнил, какую именно менять/отменять — СТРОГО возвращай "status": "clarify".
+    2. УТОЧНЕНИЕ ("clarify"): Если не хватает данных (не ясна дата, точный предмет, тип пары или время), верни "status": "clarify". В поле "message" задай короткий, вежливый вопрос и ОБЯЗАТЕЛЬНО перечисли доступные варианты из расписания (например: "Какую именно пару отменить: лекцию в 10:35 или практику в 14:15?").
+    3. УСПЕХ ("success"): Если однозначно понятно, о какой паре речь, верни "status": "success".
+    4. ТИП ПАРЫ ("new_type"): СТРОГО используй системные значения: LECTURE, PRACTICE, LABORATORY, SEMINAR, EXAM, CONTROL_WORK, CONSULTATION. Если пара переносится/заменяется, скопируй тип из старой пары, либо определи по контексту (например, "лаба" = LABORATORY).
+    5. ВРЕМЯ ("old_time"): ОБЯЗАТЕЛЬНО скопируй точное время старой пары (HH:MM) из расписания. Это критически важно для удаления нужной пары.
+    6. СОХРАНЕНИЕ ДАННЫХ: Если аудитория, преподаватель или время не меняются — скопируй их из исходного расписания в новые поля.
     
-    ВЫВОД СТРОГО В JSON, начиная с {{ и заканчивая }}:
+    ВЫВОД СТРОГО В JSON (начиная с {{ и заканчивая }}):
     {{
         "status": "success" или "clarify",
-        "message": "Твой вопрос (или null)",
-        "action": "cancel" или "replace",
+        "message": "Твой уточняющий вопрос с вариантами (или null, если success)",
+        "action": "cancel", "replace" или "add",
         "date": "YYYY-MM-DD",
         "date_ru": "ДД.ММ.ГГГГ",
-        "old_subject": "точное название из расписания или null",
-        "new_subject": "название новой пары (без указания типа и без слова изменено) или null",
+        "old_subject": "Точное название предмета из расписания (или null при add)",
+        "old_time": "HH:MM (время отменяемой/заменяемой пары из расписания) или null",
+        "new_subject": "Название новой пары (без указания типа и слова изменено) или null",
         "new_type": "СТРОГО СИСТЕМНОЕ ЗНАЧЕНИЕ (LECTURE, PRACTICE и т.д.) или null",
         "new_teacher": "ФИО преподавателя или null",
-        "new_time": "HH:MM или null",
-        "new_loc": "аудитория или null"
+        "new_time": "HH:MM (новое время) или null",
+        "new_loc": "Номер аудитории или null"
     }}
     """
     
@@ -735,18 +819,18 @@ def handle_smart_message(m):
         
         text = f"✅ **Всё понял!**\n📅 {data.get('date_ru')}\n"
         if data.get('action') == 'cancel': 
-            text += f"❌ Убираем: {data.get('old_subject')}"
+            text += f"Убираем: {data.get('old_subject')}"
         else: 
             type_map_ru = {"LECTURE": "Лекция", "PRACTICE": "Практика", "LABORATORY": "Лаба", "SEMINAR": "Семинар"}
             ru_type = type_map_ru.get(data.get('new_type'), 'Пара')
             
-            teacher_str = f"\n👨‍🏫 Преподаватель: {data.get('new_teacher')}" if data.get('new_teacher') else ""
+            teacher_str = f"\nПреподаватель: {data.get('new_teacher')}" if data.get('new_teacher') else ""
             loc_str = data.get('new_loc') or "Не указано"
             
             clean_new_sub = data.get('new_subject', '').strip()
             if clean_new_sub: clean_new_sub = clean_new_sub[0].upper() + clean_new_sub[1:]
             
-            text += f"🆕 Ставим: {clean_new_sub} ({ru_type}) в {data.get('new_time')}\n📍 Ауд: {loc_str} ⚠️{teacher_str}"
+            text += f"🆕 Изменяем на: {clean_new_sub} ({ru_type}) в {data.get('new_time')}\nАуд.: {loc_str} ⚠️{teacher_str}"
             if data.get('old_subject'):
                 text += f"\n*(Вместо: {data.get('old_subject')})*"
             
@@ -756,7 +840,7 @@ def handle_smart_message(m):
         
     except Exception as e: 
         logger.error(f"AI Request Error: {e}")
-        bot.edit_message_text("❌ Ошибка при связи с сервером ИИ. Попробуй чуть позже.", cid, msg.message_id)
+        bot.edit_message_text("❌ Ошибка при связи с сервером ИИ. Попробуйте чуть позже.", cid, msg.message_id)
 
 def load_schedule(cid, eid, df, dt, mid=None):
     text = "⏳ Получаю расписание..."
@@ -769,13 +853,13 @@ def load_schedule(cid, eid, df, dt, mid=None):
             bot.edit_message_text("❌ Пусто.", cid, mid, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")))
             return
             
-        events = apply_ai_overrides(ScheduleCore.parse_events(raw), cid) 
+        events = apply_ai_overrides(ScheduleCore.parse_events(raw), cid, df, dt) 
         
         if events:
             user_data[cid]['name'] = f"TSU_{e_name}_{df}.ics"
             f_ical, count = ScheduleCore.generate_ics(events, user_data[cid], e_type)
             bot.delete_message(cid, mid)
-            bot.send_document(cid, (user_data[cid]['name'], f_ical), caption=f"📊 Найдено {count} пар.", reply_markup=markup_download())
+            bot.send_document(cid, (user_data[cid]['name'], f_ical), caption=f"📊 В расписании найдено {count} занятий.\nЗагружайте расписание!", reply_markup=markup_download())
         else: bot.edit_message_text("❌ Пусто.", cid, mid, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")))
     except: bot.edit_message_text("❌ Ошибка.", cid, mid, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")))
 
@@ -788,9 +872,9 @@ def cb(c):
         data = user_state.get(f"ai_{cid}")
         if data:
             with sqlite3.connect(DB_FILE) as conn:
-                conn.execute("INSERT INTO overrides (user_id, target_date, action, old_subject, new_subject, new_time, new_loc, new_type, new_teacher) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                             (cid, data.get('date'), data.get('action'), data.get('old_subject'), data.get('new_subject'), data.get('new_time'), data.get('new_loc'), data.get('new_type'), data.get('new_teacher')))
-            bot.edit_message_text("✅ Изменения сохранены! Скачай расписание, чтобы они применились.", cid, c.message.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🏠 В меню", callback_data="back_to_main")))
+                conn.execute("INSERT INTO overrides (user_id, target_date, action, old_subject, new_subject, new_time, new_loc, new_type, new_teacher, old_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             (cid, data.get('date'), data.get('action'), data.get('old_subject'), data.get('new_subject'), data.get('new_time'), data.get('new_loc'), data.get('new_type'), data.get('new_teacher'), data.get('old_time')))
+            bot.edit_message_text("✅ Изменения сохранены! Скачайте расписание, чтобы они применились.", cid, c.message.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🏠 В меню", callback_data="back_to_main")))
             user_state.pop(f"ai_{cid}", None)
             
     elif c.data.startswith("tsub_"):
@@ -803,19 +887,34 @@ def cb(c):
         save_user_settings(cid, user_data[cid])
         bot.edit_message_reply_markup(cid, c.message.message_id, reply_markup=markup_subgroups(cid, is_onb))
 
-    elif c.data == "onb_sub_done":
+    # --- ШАГИ ОНБОРДИНГА ---
+    elif c.data == "onb_step_disc":
         raw = user_data[cid].pop('raw_temp', None)
         update_disciplines_for_subgroup(cid, raw, "group")
         save_user_settings(cid, user_data[cid])
-        bot.edit_message_text("🎓 **Шаг 2: Предметы**", cid, c.message.message_id, parse_mode="Markdown", reply_markup=markup_disc(cid, True))
+        bot.edit_message_text("📚 **Выберите предметы, которые в дальнейшем будут исключены из расписания: \nВыбранные дисциплины можно будет изменить в любой момент", cid, c.message.message_id, parse_mode="Markdown", reply_markup=markup_disc(cid, True))
 
-    elif c.data == "onboard_to_prefs": 
-        bot.edit_message_text(f"⚙️ **Шаг 3: Настройки**", cid, c.message.message_id, parse_mode="Markdown", reply_markup=markup_prefs(cid, True))
+    elif c.data == "onb_step_emoji": 
+        bot.edit_message_text("🎨 **Здесь можно выбрать условные обозначения для пар в календаре:", cid, c.message.message_id, parse_mode="Markdown", reply_markup=markup_onb_emoji(cid))
+    
+    elif c.data == "onb_step_remind":
+        bot.edit_message_text("⏱ Здесь можно настроить время уведомлений о ближайшем занятии", cid, c.message.message_id, parse_mode="Markdown", reply_markup=markup_onb_remind(cid))
+        
+    elif c.data == "onb_step_rtype":
+        bot.edit_message_text("🔔 **Выберите источник уведомлений:", cid, c.message.message_id, parse_mode="Markdown", reply_markup=markup_onb_rtype(cid))
+        
+    elif c.data == "onb_step_auto":
+        bot.edit_message_text("📬 **Я могу еженедельно отправлять персонализированный файл с расписанием в чат . Остается только выбрать время:", cid, c.message.message_id, parse_mode="Markdown", reply_markup=markup_onb_auto(cid))
+
+    elif c.data == "onb_step_ai":
+        ai_text = "🤖  Сообщение от разработчика.\nНа данный момент тестируется исопльзование ИИ в боте с целью изменения расписания на следующую неделю в случае переноса/отмены занятия. \nПри случае, попробуйте переслать боту сообщение (например, от старосты) о переносе пары и проверьте функционал. \nБуду рад получить обратную связь"
+        bot.edit_message_text(ai_text, cid, c.message.message_id, parse_mode="Markdown", reply_markup=markup_onb_ai())
+
     elif c.data == "onboard_finish":
-        bot.edit_message_text("🎉 **Готово!** Выберите период:", cid, c.message.message_id, parse_mode="Markdown", reply_markup=markup_dates(user_data[cid]['entity_id']))
+        bot.edit_message_text("🎉 **Настройка завершена!** Выберите период:", cid, c.message.message_id, parse_mode="Markdown", reply_markup=markup_dates(user_data[cid]['entity_id']))
 
-    elif c.data == "role_student": user_state[cid] = "wait_group"; bot.edit_message_text("Номер группы?", cid, c.message.message_id)
-    elif c.data == "role_teacher": user_state[cid] = "wait_teacher"; bot.edit_message_text("Фамилия?", cid, c.message.message_id)
+    elif c.data == "role_student": user_state[cid] = "wait_group"; bot.edit_message_text("Напишите в чат номер своей группы \n(Например: 012345):", cid, c.message.message_id)
+    elif c.data == "role_teacher": user_state[cid] = "wait_teacher"; bot.edit_message_text("Введите в чат Вашу фамилию:", cid, c.message.message_id)
     
     elif c.data.startswith("sel_g_") or c.data.startswith("sel_t_"):
         eid = c.data[6:]
@@ -831,10 +930,10 @@ def cb(c):
             user_data[cid]['subgroups_list'] = ScheduleCore.extract_dynamic_subgroups(raw)
             if user_data[cid]['subgroups_list']: user_data[cid]['subgroups'] = [user_data[cid]['subgroups_list'][0]]
             save_user_settings(cid, user_data[cid])
-            bot.edit_message_text("Выбери подгруппы:", cid, c.message.message_id, reply_markup=markup_subgroups(cid, True))
+            bot.edit_message_text("🎓 **Выберите подгруппы**", cid, c.message.message_id, parse_mode="Markdown", reply_markup=markup_subgroups(cid, True))
         else:
             save_user_settings(cid, user_data[cid])
-            bot.edit_message_text("Настройки:", cid, c.message.message_id, reply_markup=markup_prefs(cid, True))
+            bot.edit_message_text("🎨 **Условные обозначения**", cid, c.message.message_id, parse_mode="Markdown", reply_markup=markup_onb_emoji(cid))
 
     elif c.data == "menu_dates": bot.edit_message_text("Период:", cid, c.message.message_id, reply_markup=markup_dates(user_data[cid]['entity_id']))
     elif c.data == "menu_profile": bot.edit_message_text("Профиль:", cid, c.message.message_id, reply_markup=markup_profile(cid, get_entity_info(user_data[cid]['entity_id'])[0]))
@@ -850,7 +949,7 @@ def cb(c):
         try: bot.edit_message_text("Предметы:", cid, c.message.message_id, reply_markup=markup_disc(cid, False))
         except: pass
         
-    elif c.data == "menu_prefs": bot.edit_message_text("Настройки:", cid, c.message.message_id, reply_markup=markup_prefs(cid, False))
+    elif c.data == "menu_prefs": bot.edit_message_text("Настройки:", cid, c.message.message_id, reply_markup=markup_prefs(cid))
     elif c.data == "menu_subgroups": bot.edit_message_text("Подгруппы:", cid, c.message.message_id, reply_markup=markup_subgroups(cid, False))
     elif c.data == "menu_feedback": user_state[cid] = "wait_feedback"; bot.edit_message_text("Напишите сообщение:", cid, c.message.message_id)
 
@@ -878,7 +977,15 @@ def cb(c):
         elif cmd == "toggle_atime": s['auto_time'] = 13 if s.get('auto_time', 8) == 8 else (19 if s.get('auto_time', 8) == 13 else 8)
         elif cmd == "toggle_rtype": s['remind_type'] = 1 if s.get('remind_type', 0) == 0 else 0
         save_user_settings(cid, s)
-        bot.edit_message_reply_markup(cid, c.message.message_id, reply_markup=markup_prefs(cid, is_onb))
+        
+        if is_onb:
+            if cmd == "toggle_emoji": mk = markup_onb_emoji(cid)
+            elif cmd == "toggle_remind": mk = markup_onb_remind(cid)
+            elif cmd == "toggle_rtype": mk = markup_onb_rtype(cid)
+            else: mk = markup_onb_auto(cid)
+            bot.edit_message_reply_markup(cid, c.message.message_id, reply_markup=mk)
+        else:
+            bot.edit_message_reply_markup(cid, c.message.message_id, reply_markup=markup_prefs(cid))
 
     elif c.data.startswith("d_") or c.data.startswith("do_"):
         is_onb = c.data.startswith("do_")
